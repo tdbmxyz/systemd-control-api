@@ -168,15 +168,12 @@ in {
 
     # Create dedicated user and group for the service
     users = mkIf (cfg.user == "systemd-control-api") {
-      users = {
-        "${cfg.user}" = {
-          isSystemUser = true;
-          group = cfg.group;
-          description = "Systemd Control API service user";
-        };
-
-        groups.${cfg.group} = {};
+      users.${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.group;
+        description = "Systemd Control API service user";
       };
+      groups.${cfg.group} = {};
     };
 
     # Polkit rule to allow the API user to control specified services
