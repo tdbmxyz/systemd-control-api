@@ -147,6 +147,20 @@ in {
       example = ["worker-"];
     };
 
+    security = {
+      allowedHosts = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        description = ''          List of allowed client IPs or hostnames for host-based access control.
+          Supports exact IPs, CIDR notation (e.g., "192.168.1.0/24"), and "localhost".
+          If empty, only API key authentication is used.
+          If set, clients must match both the API key (if configured) AND be in this list.
+          Can also be set via SYSTEMD_CONTROL_API_ALLOWED_HOSTS in the environment file.
+        '';
+        example = ["localhost" "192.168.1.0/24" "10.0.0.50"];
+      };
+    };
+
     openFirewall = mkOption {
       type = types.bool;
       default = false;
@@ -157,8 +171,8 @@ in {
   config = mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.environmentFile != null;
-        message = "services.systemd-control-api.environmentFile must be set (containing SYSTEMD_CONTROL_API_KEY)";
+        assertion = cfg.environmentFile != null || cfg.security.allowedHosts != [];
+        message = "services.systemd-control-api: At least one security method must be configured - set environmentFile (containing SYSTEMD_CONTROL_API_KEY) and/or security.allowedHosts";
       }
       {
         assertion = cfg.services != [];
@@ -193,10 +207,18 @@ in {
       after = ["network.target"];
       wantedBy = ["multi-user.target"];
 
-      environment = {
-        SYSTEMD_CONTROL_API_PORT = toString cfg.port;
-        SYSTEMD_CONTROL_API_SERVICES = servicesJson;
-      };
+      environment =
+        {
+          SYSTEMD_CONTROL_API_PORT = toString cfg.port;
+          SYSTEMD_CONTROL_API_SERVICES = servicesJson;
+        }
+        // (
+          if cfg.security.allowedHosts != []
+          then {
+            SYSTEMD_CONTROL_API_ALLOWED_HOSTS = concatStringsSep "," cfg.security.allowedHosts;
+          }
+          else {}
+        );
 
       serviceConfig = {
         Type = "simple";
@@ -205,7 +227,7 @@ in {
         ExecStart = "${cfg.package}/bin/systemd-control-api";
         Restart = "always";
         RestartSec = "10s";
-        EnvironmentFile = cfg.environmentFile;
+        EnvironmentFile = mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
         # Security settings
         PrivateTmp = true;

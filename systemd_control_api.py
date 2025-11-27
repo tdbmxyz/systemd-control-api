@@ -7,12 +7,14 @@ Provides HTTP API endpoints for monitoring and controlling systemd services
 import json
 import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from ipaddress import ip_address, ip_network
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -24,12 +26,29 @@ from systemd import journal
 # =============================================================================
 
 
-def get_config() -> tuple[str, int, list[dict]]:
-    """Get configuration from environment variables"""
-    api_key = os.environ.get("SYSTEMD_CONTROL_API_KEY")
-    if not api_key:
-        raise ValueError("SYSTEMD_CONTROL_API_KEY environment variable is required")
+@dataclass
+class Config:
+    """Application configuration"""
 
+    api_key: str | None
+    port: int
+    services: list[dict]
+    allowed_hosts: list[str]  # Empty list means no host restriction
+
+    @property
+    def has_api_key(self) -> bool:
+        """Check if API key authentication is configured"""
+        return bool(self.api_key)
+
+    @property
+    def has_host_restriction(self) -> bool:
+        """Check if host-based restriction is configured"""
+        return len(self.allowed_hosts) > 0
+
+
+def get_config() -> Config:
+    """Get configuration from environment variables"""
+    api_key = os.environ.get("SYSTEMD_CONTROL_API_KEY")  # None if not set
     port = int(os.environ.get("SYSTEMD_CONTROL_API_PORT", "8080"))
 
     services_json = os.environ.get("SYSTEMD_CONTROL_API_SERVICES", "[]")
@@ -38,7 +57,26 @@ def get_config() -> tuple[str, int, list[dict]]:
     except json.JSONDecodeError:
         raise ValueError("SYSTEMD_CONTROL_API_SERVICES must be valid JSON")
 
-    return api_key, port, services
+    # Allowed hosts (comma-separated list of IPs or hostnames)
+    # Empty string or unset means no host restriction
+    allowed_hosts_str = os.environ.get("SYSTEMD_CONTROL_API_ALLOWED_HOSTS", "")
+    allowed_hosts = [h.strip() for h in allowed_hosts_str.split(",") if h.strip()]
+
+    config = Config(
+        api_key=api_key,
+        port=port,
+        services=services,
+        allowed_hosts=allowed_hosts,
+    )
+
+    # Validation: at least one security method must be configured
+    if not config.has_api_key and not config.has_host_restriction:
+        raise ValueError(
+            "At least one security method must be configured: "
+            "set SYSTEMD_CONTROL_API_KEY and/or SYSTEMD_CONTROL_API_ALLOWED_HOSTS"
+        )
+
+    return config
 
 
 # =============================================================================
@@ -228,26 +266,36 @@ def control_service_fallback(
 # =============================================================================
 
 # Global config (loaded at startup)
-API_KEY: str = ""
-PORT: int = 8080
-SERVICES: list[dict] = []
+CONFIG: Config | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: load config on startup"""
-    global API_KEY, PORT, SERVICES
-    API_KEY, PORT, SERVICES = get_config()
+    """Application lifespan: startup and shutdown logging"""
+    if CONFIG is None:
+        raise RuntimeError("CONFIG not initialized. Call init_config() first.")
+
+    # Build security mode description
+    security_modes = []
+    if CONFIG.has_api_key:
+        security_modes.append("API key")
+    if CONFIG.has_host_restriction:
+        security_modes.append(f"host allowlist ({len(CONFIG.allowed_hosts)} hosts)")
 
     journal.send(
-        f"systemd-control-api: Starting on port {PORT}, monitoring {len(SERVICES)} services",
+        f"systemd-control-api: Starting on port {CONFIG.port}, "
+        f"monitoring {len(CONFIG.services)} services, "
+        f"security: {' + '.join(security_modes)}",
         PRIORITY=journal.LOG_INFO,
         SYSLOG_IDENTIFIER="systemd-control-api",
     )
 
-    print(f"Starting Systemd Control API on port {PORT}")
-    print(f"Monitoring {len(SERVICES)} services:")
-    for service in SERVICES:
+    print(f"Starting Systemd Control API on port {CONFIG.port}")
+    print(f"Security: {' + '.join(security_modes)}")
+    if CONFIG.has_host_restriction:
+        print(f"Allowed hosts: {', '.join(CONFIG.allowed_hosts)}")
+    print(f"Monitoring {len(CONFIG.services)} services:")
+    for service in CONFIG.services:
         print(f"  - {service['displayName']} ({service['service']})")
 
     yield
@@ -259,42 +307,191 @@ async def lifespan(app: FastAPI):
     )
 
 
-app = FastAPI(
-    title="Systemd Control API",
-    description="HTTP API for monitoring and controlling systemd services",
-    version="0.1.0",
-    lifespan=lifespan,
-)
+def init_config() -> Config:
+    """Initialize global config from environment variables."""
+    global CONFIG
+    CONFIG = get_config()
+    return CONFIG
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def get_cors_origins() -> list[str]:
+    """Get CORS origins based on allowed hosts configuration.
+
+    If allowed_hosts is configured, converts them to origin URLs.
+    Otherwise returns empty list (restrictive CORS).
+    """
+    if CONFIG is None or not CONFIG.has_host_restriction:
+        return []
+
+    origins = []
+    for host in CONFIG.allowed_hosts:
+        # Handle localhost specially
+        if host.lower() == "localhost":
+            origins.extend(["http://localhost", "https://localhost"])
+        elif "/" not in host:  # Not CIDR, exact IP or hostname
+            origins.extend([f"http://{host}", f"https://{host}"])
+        # CIDR ranges can't be used directly in CORS,
+        # IP check is done in verify_security
+
+    return origins
+
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    application = FastAPI(
+        title="Systemd Control API",
+        description="HTTP API for monitoring and controlling systemd services",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    # Configure CORS middleware
+    # Must be done at app creation, not during lifespan
+    cors_origins = get_cors_origins()
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=bool(cors_origins),
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    return application
+
+
+# Initialize config at module load time (for uvicorn import)
+# This may fail if env vars aren't set, which is expected during testing
+try:
+    init_config()
+except ValueError:
+    # Config will be initialized later in main() or tests
+    pass
+
+# Create the app instance
+app = create_app()
 
 # Security
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
-async def verify_api_key(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> str:
-    """Verify the API key from the Authorization header"""
-    if credentials.credentials != API_KEY:
+def is_ip_allowed(client_ip: str, allowed_hosts: list[str]) -> bool:
+    """Check if client IP is in the allowed hosts list.
+
+    Supports:
+    - Exact IP match (e.g., "192.168.1.100")
+    - CIDR notation (e.g., "192.168.1.0/24")
+    - Localhost variations ("localhost", "127.0.0.1", "::1")
+    """
+    # Normalize localhost
+    localhost_aliases = {"localhost", "127.0.0.1", "::1"}
+
+    try:
+        client_addr = ip_address(client_ip)
+    except ValueError:
+        # Not a valid IP, do string comparison
+        return client_ip in allowed_hosts
+
+    for allowed in allowed_hosts:
+        # Handle localhost specially
+        if allowed.lower() == "localhost":
+            if client_ip in localhost_aliases or str(client_addr) in localhost_aliases:
+                return True
+            continue
+
+        try:
+            # Try CIDR notation first
+            if "/" in allowed:
+                if client_addr in ip_network(allowed, strict=False):
+                    return True
+            else:
+                # Exact IP match
+                if client_addr == ip_address(allowed):
+                    return True
+        except ValueError:
+            # Not a valid IP/network, do string comparison
+            if client_ip == allowed:
+                return True
+
+    return False
+
+
+async def verify_security(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> None:
+    """Verify request security based on configured methods.
+
+    Security logic:
+    - If both API key and host restriction are configured: both must pass
+    - If only API key is configured: API key must be valid
+    - If only host restriction is configured: client IP must be allowed
+    """
+    if CONFIG is None:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server not configured",
         )
-    return credentials.credentials
+
+    client_host = request.client.host if request.client else "unknown"
+    api_key_valid = False
+    host_valid = False
+
+    # Check API key if configured
+    if CONFIG.has_api_key:
+        if credentials and credentials.credentials == CONFIG.api_key:
+            api_key_valid = True
+
+    # Check host if configured
+    if CONFIG.has_host_restriction:
+        if request.client and is_ip_allowed(request.client.host, CONFIG.allowed_hosts):
+            host_valid = True
+
+    # Determine if access should be granted
+    access_granted = False
+
+    if CONFIG.has_api_key and CONFIG.has_host_restriction:
+        # Both configured: both must pass
+        access_granted = api_key_valid and host_valid
+    elif CONFIG.has_api_key:
+        # Only API key configured
+        access_granted = api_key_valid
+    elif CONFIG.has_host_restriction:
+        # Only host restriction configured
+        access_granted = host_valid
+
+    if not access_granted:
+        # Build detailed error message
+        reasons = []
+        if CONFIG.has_api_key and not api_key_valid:
+            reasons.append("invalid or missing API key")
+        if CONFIG.has_host_restriction and not host_valid:
+            reasons.append(f"host {client_host} not in allowed list")
+
+        journal.send(
+            f"systemd-control-api: Access denied from {client_host}: {', '.join(reasons)}",
+            PRIORITY=journal.LOG_WARNING,
+            SYSLOG_IDENTIFIER="systemd-control-api",
+        )
+
+        # Use 401 for auth issues, 403 for host-only issues
+        if CONFIG.has_api_key and not api_key_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Access denied: {', '.join(reasons)}",
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: {', '.join(reasons)}",
+            )
 
 
 def get_service_by_name(service_name: str) -> dict | None:
     """Find a service in the configured services list"""
+    if CONFIG is None:
+        return None
     return next(
-        (s for s in SERVICES if s["service"] == service_name),
+        (s for s in CONFIG.services if s["service"] == service_name),
         None,
     )
 
@@ -310,21 +507,24 @@ async def health_check():
     return HealthResponse(
         status="healthy",
         timestamp=datetime.now().isoformat(),
-        services_count=len(SERVICES),
+        services_count=len(CONFIG.services) if CONFIG else 0,
     )
 
 
 @app.get(
     "/services",
     response_model=ServicesResponse,
-    responses={401: {"model": ErrorResponse}},
+    responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
     tags=["Services"],
 )
-async def get_services(_: str = Depends(verify_api_key)):
+async def get_services(_: None = Depends(verify_security)):
     """Get status of all configured services"""
+    if CONFIG is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
     services_status = []
 
-    for service_info in SERVICES:
+    for service_info in CONFIG.services:
         service_name = service_info["service"]
         status_info = get_service_status_via_dbus(service_name)
 
@@ -349,6 +549,7 @@ async def get_services(_: str = Depends(verify_api_key)):
     response_model=ServiceControlResponse,
     responses={
         401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
         404: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
     },
@@ -357,7 +558,7 @@ async def get_services(_: str = Depends(verify_api_key)):
 async def control_service(
     service_name: str,
     action: ServiceAction,
-    _: str = Depends(verify_api_key),
+    _: None = Depends(verify_security),
 ):
     """Control a service (start, stop, restart)"""
     service_info = get_service_by_name(service_name)
@@ -384,14 +585,15 @@ async def control_service(
 
 def main():
     """Start the API server with uvicorn"""
-    # Load config early to get port and validate
-    global API_KEY, PORT, SERVICES
-    API_KEY, PORT, SERVICES = get_config()
+    # Ensure config is loaded
+    global CONFIG
+    if CONFIG is None:
+        CONFIG = get_config()
 
     uvicorn.run(
         "systemd_control_api:app",
         host="0.0.0.0",
-        port=PORT,
+        port=CONFIG.port,
         log_level="info",
         access_log=True,
     )

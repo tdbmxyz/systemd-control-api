@@ -14,6 +14,7 @@ with python313Packages;
 
     pyproject = true;
     build-system = [setuptools];
+    enabledTestPaths = ["test/test*.py"];
 
     src = ./.;
   }

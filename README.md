@@ -169,12 +169,64 @@ curl -X POST \
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enable` | bool | `false` | Enable the systemd control API |
-| `port` | int | `8091` | Port for the API server |
-| `environmentFile` | path | *required* | Path to file containing `SYSTEMD_CONTROL_API_KEY=<secret>` |
+| `port` | int | `8080` | Port for the API server |
+| `environmentFile` | path | `null` | Path to file containing `SYSTEMD_CONTROL_API_KEY=<secret>` |
 | `user` | string | `"systemd-control-api"` | User to run the API service |
 | `group` | string | `"systemd-control-api"` | Group for the API service |
 | `services` | list | `[]` | List of services to expose |
 | `servicePatterns` | list | `[]` | Additional service name patterns for polkit |
+| `security.allowedHosts` | list | `[]` | Allowed client IPs/networks (optional) |
+| `openFirewall` | bool | `false` | Open the API port in the firewall |
+
+### Security Configuration
+
+At least one security method must be configured:
+- **API Key**: Set `environmentFile` pointing to a file containing `SYSTEMD_CONTROL_API_KEY=<secret>`
+- **Host Allowlist**: Set `security.allowedHosts` with allowed IPs/networks
+
+If both are configured, requests must satisfy **both** requirements.
+
+#### API Key Only (Default)
+
+```nix
+{
+  services.systemd-control-api = {
+    enable = true;
+    environmentFile = "/run/secrets/systemd-control-api";
+    services = [ /* ... */ ];
+  };
+}
+```
+
+#### Host-Based Access Only
+
+```nix
+{
+  services.systemd-control-api = {
+    enable = true;
+    security.allowedHosts = ["localhost" "192.168.1.0/24"];
+    services = [ /* ... */ ];
+  };
+}
+```
+
+#### Both Methods (Most Secure)
+
+```nix
+{
+  services.systemd-control-api = {
+    enable = true;
+    environmentFile = "/run/secrets/systemd-control-api";
+    security.allowedHosts = ["localhost" "10.0.0.50"];
+    services = [ /* ... */ ];
+  };
+}
+```
+
+The `security.allowedHosts` option supports:
+- Exact IPs: `"192.168.1.100"`
+- CIDR notation: `"192.168.1.0/24"`
+- Localhost: `"localhost"` (matches `127.0.0.1` and `::1`)
 
 ### Service Definition
 
@@ -190,7 +242,8 @@ Each service in the `services` list should have:
 ## Security Considerations
 
 1. **API Key**: Always use a strong API key stored in the environment file (not in the Nix store)
-2. **Environment File**: Use proper file permissions (e.g., `chmod 600`) and ownership for the secrets file
-3. **Firewall**: Consider restricting API access to specific networks
-4. **Polkit Rules**: The module only grants control over explicitly configured services
-5. **HTTPS**: Use a reverse proxy (like Traefik) for HTTPS in production
+2. **Host Allowlist**: Restrict access to known IPs when possible
+3. **Environment File**: Use proper file permissions (e.g., `chmod 600`) and ownership for the secrets file
+4. **Firewall**: Consider keeping `openFirewall = false` and using reverse proxy rules
+5. **Polkit Rules**: The module only grants control over explicitly configured services
+6. **HTTPS**: Use a reverse proxy (like Traefik or nginx) for HTTPS in production
