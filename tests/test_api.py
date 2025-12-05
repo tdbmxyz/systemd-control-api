@@ -53,6 +53,15 @@ def test_env_hosts_only():
 
 
 @pytest.fixture
+def test_env_no_security():
+    """Environment variables with no security (for reverse proxy)."""
+    return {
+        "SYSTEMD_CONTROL_API_PORT": "8080",
+        "SYSTEMD_CONTROL_API_SERVICES": str(TEST_SERVICES).replace("'", '"'),
+    }
+
+
+@pytest.fixture
 def mock_systemd():
     """Mock systemd D-Bus calls."""
     with patch("systemd_control_api.get_service_status_via_dbus") as mock_status:
@@ -103,6 +112,21 @@ def client_with_hosts(test_env_with_hosts, mock_systemd):
 def client_hosts_only(test_env_hosts_only, mock_systemd):
     """Create test client with only host restriction."""
     with patch.dict(os.environ, test_env_hosts_only, clear=True):
+        import systemd_control_api
+
+        systemd_control_api.CONFIG = None
+        systemd_control_api.init_config()
+        app = systemd_control_api.create_app()
+
+        from fastapi.testclient import TestClient
+
+        yield TestClient(app)
+
+
+@pytest.fixture
+def client_no_security(test_env_no_security, mock_systemd):
+    """Create test client with no security (reverse proxy mode)."""
+    with patch.dict(os.environ, test_env_no_security, clear=True):
         import systemd_control_api
 
         systemd_control_api.CONFIG = None
@@ -271,3 +295,28 @@ class TestOpenAPIDocumentation:
         """ReDoc should be available."""
         response = client.get("/redoc")
         assert response.status_code == 200
+
+
+class TestNoSecurityMode:
+    """Tests for running without any security (reverse proxy mode)."""
+
+    def test_services_no_auth_required(self, client_no_security):
+        """Services endpoint should work without auth when no security is configured."""
+        response = client_no_security.get("/services")
+        assert response.status_code == 200
+        data = response.json()
+        assert "services" in data
+        assert len(data["services"]) == 2
+
+    def test_control_no_auth_required(self, client_no_security, mock_systemd):
+        """Service control should work without auth when no security is configured."""
+        response = client_no_security.post("/service/nginx.service/restart")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+    def test_health_still_works(self, client_no_security):
+        """Health endpoint should still work without security."""
+        response = client_no_security.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "healthy"

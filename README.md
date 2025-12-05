@@ -108,11 +108,26 @@ Add to your `flake.nix`:
 
 ## API Endpoints
 
+All endpoints require authentication unless running in no-security mode (reverse proxy deployment).
+
+### GET `/health`
+
+Health check endpoint (always accessible without authentication).
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2025-11-26T10:30:00",
+  "services_count": 2
+}
+```
+
 ### GET `/services`
 
 Get status of all configured services.
 
-**Headers:**
+**Headers (when security is enabled):**
 ```
 Authorization: Bearer your-super-secure-api-key-here
 ```
@@ -141,7 +156,7 @@ Authorization: Bearer your-super-secure-api-key-here
 
 Control a service (start, stop, restart).
 
-**Headers:**
+**Headers (when security is enabled):**
 ```
 Authorization: Bearer your-super-secure-api-key-here
 ```
@@ -150,8 +165,13 @@ Authorization: Bearer your-super-secure-api-key-here
 
 **Example:**
 ```bash
+# With authentication
 curl -X POST \
   -H "Authorization: Bearer your-super-secure-api-key-here" \
+  http://localhost:8091/service/nginx.service/restart
+
+# Without authentication (reverse proxy mode)
+curl -X POST \
   http://localhost:8091/service/nginx.service/restart
 ```
 
@@ -163,6 +183,12 @@ curl -X POST \
   "display_name": "Web Server"
 }
 ```
+
+### Interactive API Documentation
+
+The API provides automatic interactive documentation:
+- **Swagger UI**: http://localhost:8091/docs
+- **ReDoc**: http://localhost:8091/redoc
 
 ## Configuration Options
 
@@ -180,11 +206,32 @@ curl -X POST \
 
 ### Security Configuration
 
-At least one security method must be configured:
-- **API Key**: Set `environmentFile` pointing to a file containing `SYSTEMD_CONTROL_API_KEY=<secret>`
-- **Host Allowlist**: Set `security.allowedHosts` with allowed IPs/networks
+The API supports three security modes:
 
-If both are configured, requests must satisfy **both** requirements.
+1. **No Security** (for reverse proxy deployments)
+2. **API Key Only** (default for direct access)
+3. **Host Allowlist Only** (for trusted networks)
+4. **Both Methods** (most secure)
+
+If both API key and host allowlist are configured, requests must satisfy **both** requirements.
+
+#### No Security (Reverse Proxy Mode)
+
+When deploying behind a reverse proxy that handles authentication, you can disable all built-in security:
+
+```nix
+{
+  services.systemd-control-api = {
+    enable = true;
+    # No environmentFile, no allowedHosts
+    services = [ /* ... */ ];
+  };
+}
+```
+
+**Use case:** When using with Glance widgets or other static HTML/JS frontends behind a reverse proxy like Traefik, nginx, or Caddy that handles authentication.
+
+⚠️ **Warning:** Only use this mode when the API is not directly accessible from untrusted networks.
 
 #### API Key Only (Default)
 
@@ -241,9 +288,23 @@ Each service in the `services` list should have:
 
 ## Security Considerations
 
+### Deployment Modes
+
+**Direct Access (with API key and/or host restriction):**
 1. **API Key**: Always use a strong API key stored in the environment file (not in the Nix store)
 2. **Host Allowlist**: Restrict access to known IPs when possible
 3. **Environment File**: Use proper file permissions (e.g., `chmod 600`) and ownership for the secrets file
 4. **Firewall**: Consider keeping `openFirewall = false` and using reverse proxy rules
-5. **Polkit Rules**: The module only grants control over explicitly configured services
-6. **HTTPS**: Use a reverse proxy (like Traefik or nginx) for HTTPS in production
+
+**Reverse Proxy Mode (no built-in security):**
+1. **Never expose directly**: The API should only be accessible through your reverse proxy
+2. **Proxy Authentication**: Configure authentication in your reverse proxy (Traefik, nginx, Caddy, etc.)
+3. **Network Isolation**: Use firewall rules or Docker networks to prevent direct access
+4. **HTTPS**: Always use HTTPS in production, configured at the reverse proxy level
+
+### General Security
+
+1. **Polkit Rules**: The module only grants control over explicitly configured services
+2. **Service Patterns**: Be careful with `servicePatterns` - avoid overly broad patterns like `"*"`
+3. **Least Privilege**: Run the API with minimal required permissions
+4. **Monitoring**: Monitor API access logs for suspicious activity

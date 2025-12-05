@@ -55,12 +55,14 @@ in {
       default = null;
       example = "/run/secrets/systemd-control-api";
       description = ''
-        Path to an environment file containing secrets.
+        Path to an environment file containing secrets (optional).
         This file is not added to the nix store, so it can be used to pass secrets.
         The file should contain:
         ```
         SYSTEMD_CONTROL_API_KEY=your-super-secure-api-key-here
         ```
+        If not set and no allowed hosts are configured, the API will be accessible without authentication.
+        This is suitable for deployments behind a reverse proxy that handles authentication.
       '';
     };
 
@@ -152,10 +154,11 @@ in {
         type = types.listOf types.str;
         default = [];
         description = ''          List of allowed client IPs or hostnames for host-based access control.
-          Supports exact IPs, CIDR notation (e.g., "192.168.1.0/24"), and "localhost".
-          If empty, only API key authentication is used.
-          If set, clients must match both the API key (if configured) AND be in this list.
-          Can also be set via SYSTEMD_CONTROL_API_ALLOWED_HOSTS in the environment file.
+                    Supports exact IPs, CIDR notation (e.g., "192.168.1.0/24"), and "localhost".
+                    If empty, no host-based restriction is applied.
+                    If both API key and allowed hosts are configured, requests must match both.
+                    Note: When behind a reverse proxy, the client IP will be the proxy's IP.
+                    Can also be set via SYSTEMD_CONTROL_API_ALLOWED_HOSTS in the environment file.
         '';
         example = ["localhost" "192.168.1.0/24" "10.0.0.50"];
       };
@@ -170,10 +173,6 @@ in {
 
   config = mkIf cfg.enable {
     assertions = [
-      {
-        assertion = cfg.environmentFile != null || cfg.security.allowedHosts != [];
-        message = "services.systemd-control-api: At least one security method must be configured - set environmentFile (containing SYSTEMD_CONTROL_API_KEY) and/or security.allowedHosts";
-      }
       {
         assertion = cfg.services != [];
         message = "services.systemd-control-api.services must not be empty";

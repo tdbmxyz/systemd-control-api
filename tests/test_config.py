@@ -59,16 +59,20 @@ class TestGetConfig:
             assert config.has_api_key is True
             assert config.has_host_restriction is True
 
-    def test_config_fails_without_security(self):
-        """Config should fail if no security method is configured."""
+    def test_config_without_security(self):
+        """Config should work without any security for reverse proxy deployments."""
         from systemd_control_api import get_config
 
         env = {
             "SYSTEMD_CONTROL_API_SERVICES": "[]",
         }
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ValueError, match="At least one security method"):
-                get_config()
+            config = get_config()
+
+            assert config.api_key is None
+            assert config.allowed_hosts == []
+            assert config.has_api_key is False
+            assert config.has_host_restriction is False
 
     def test_config_default_port(self):
         """Config should use default port 8080 if not specified."""

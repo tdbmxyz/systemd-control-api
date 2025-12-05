@@ -69,12 +69,16 @@ def get_config() -> Config:
         allowed_hosts=allowed_hosts,
     )
 
-    # Validation: at least one security method must be configured
-    if not config.has_api_key and not config.has_host_restriction:
-        raise ValueError(
-            "At least one security method must be configured: "
-            "set SYSTEMD_CONTROL_API_KEY and/or SYSTEMD_CONTROL_API_ALLOWED_HOSTS"
-        )
+    # Note: Both security methods are optional
+    # If neither is configured, the API is accessible without authentication
+    # This is suitable for deployments behind a reverse proxy
+
+    # Debug logging for security configuration
+    journal.send(
+        f"systemd-control-api: Security config - API key: {config.has_api_key}, Host restriction: {config.has_host_restriction} ({len(config.allowed_hosts)} hosts)",
+        PRIORITY=journal.LOG_INFO,
+        SYSLOG_IDENTIFIER="systemd-control-api",
+    )
 
     return config
 
@@ -291,7 +295,10 @@ async def lifespan(app: FastAPI):
     )
 
     print(f"Starting Systemd Control API on port {CONFIG.port}")
-    print(f"Security: {' + '.join(security_modes)}")
+    if security_modes:
+        print(f"Security: {' + '.join(security_modes)}")
+    else:
+        print("Security: NONE (reverse proxy mode)")
     if CONFIG.has_host_restriction:
         print(f"Allowed hosts: {', '.join(CONFIG.allowed_hosts)}")
     print(f"Monitoring {len(CONFIG.services)} services:")
@@ -318,9 +325,19 @@ def get_cors_origins() -> list[str]:
     """Get CORS origins based on allowed hosts configuration.
 
     If allowed_hosts is configured, converts them to origin URLs.
+    If no security is configured, allows all origins (for reverse proxy mode).
     Otherwise returns empty list (restrictive CORS).
     """
-    if CONFIG is None or not CONFIG.has_host_restriction:
+    if CONFIG is None:
+        return []
+
+    # If no security is configured at all, allow all origins
+    # (reverse proxy deployment where proxy handles security)
+    if not CONFIG.has_api_key and not CONFIG.has_host_restriction:
+        return ["*"]
+
+    # If host restriction is configured, convert to CORS origins
+    if not CONFIG.has_host_restriction:
         return []
 
     origins = []
@@ -422,6 +439,7 @@ async def verify_security(
     """Verify request security based on configured methods.
 
     Security logic:
+    - If no security is configured: allow all requests (for reverse proxy usage)
     - If both API key and host restriction are configured: both must pass
     - If only API key is configured: API key must be valid
     - If only host restriction is configured: client IP must be allowed
@@ -433,6 +451,16 @@ async def verify_security(
         )
 
     client_host = request.client.host if request.client else "unknown"
+
+    # If no security is configured, allow all requests
+    if not CONFIG.has_api_key and not CONFIG.has_host_restriction:
+        journal.send(
+            f"systemd-control-api: Access granted from {client_host} (no security configured)",
+            PRIORITY=journal.LOG_DEBUG,
+            SYSLOG_IDENTIFIER="systemd-control-api",
+        )
+        return
+
     api_key_valid = False
     host_valid = False
 
